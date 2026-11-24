@@ -1,0 +1,103 @@
+# Hourly WoW Forever (EU) auction house pull, then a FlipLists release built from it.
+# The database lives in the Actions cache. The small summary is force-pushed to the ah-data
+# branch as a single commit, so history never grows. Each new snapshot publishes a release
+# whose zip WowUp installs (the -forever.zip suffix tells WowUp it is for Forever).
+name: AH pull and release
+
+on:
+  schedule:
+    - cron: "37 * * * *"  # GitHub runs these late and sparsely: an external hourly trigger calls workflow_dispatch
+  workflow_dispatch:
+
+permissions:
+  contents: write  # ah-data branch and releases
+  actions: write   # delete the previous database cache
+
+concurrency:
+  group: ah-pull
+  cancel-in-progress: false
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: restore
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            data/ah.sqlite
+            data/item_ids.json
+          key: ah-db-${{ github.run_id }}
+          restore-keys: ah-db-
+
+      # First run only: start from the seed database (a prerelease tagged "seed"), so the
+      # caps have a week of history instead of none
+      - name: Seed the database
+        if: steps.restore.outputs.cache-matched-key == ''
+        run: gh release download seed -D data -R "$GITHUB_REPOSITORY" || echo "no seed release, starting empty"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Pull the latest snapshot
+        run: python3 ah_pull.py
+        env:
+          BLIZZARD_CLIENT_ID: ${{ secrets.BLIZZARD_CLIENT_ID }}
+          BLIZZARD_CLIENT_SECRET: ${{ secrets.BLIZZARD_CLIENT_SECRET }}
+
+      # The summary file only exists when a new snapshot was stored, so skip the rest otherwise.
+      - name: Build the addon
+        if: hashFiles('data/ah_summary.json') != ''
+        run: python3 sync_lists.py
+        env:
+          BLIZZARD_CLIENT_ID: ${{ secrets.BLIZZARD_CLIENT_ID }}
+          BLIZZARD_CLIENT_SECRET: ${{ secrets.BLIZZARD_CLIENT_SECRET }}
+
+      - if: hashFiles('data/ah_summary.json') != ''
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            data/ah.sqlite
+            data/item_ids.json
+          key: ah-db-${{ github.run_id }}
+
+      - name: Delete the previous database cache
+        # The last check stops a re-run of the same run deleting the cache it just restored.
+        if: >-
+          hashFiles('data/ah_summary.json') != '' &&
+          steps.restore.outputs.cache-matched-key != '' &&
+          steps.restore.outputs.cache-matched-key != format('ah-db-{0}', github.run_id)
+        run: gh cache delete "${{ steps.restore.outputs.cache-matched-key }}" -R "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Push the summary to the ah-data branch
+        if: hashFiles('data/ah_summary.json') != ''
+        run: |
+          out="$RUNNER_TEMP/ah-data"
+          mkdir "$out" && cp data/ah_summary.json "$out/" && cd "$out"
+          git init -q -b ah-data
+          git add ah_summary.json
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -qm "AH summary $(date -u +'%Y-%m-%d %H:%M')"
+          git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:ah-data
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # WowUp reads the version from the zip's file name, so every release needs a new name.
+      # Only the newest 5 releases are kept (WowUp only looks at 5). The seed is never deleted.
+      - name: Publish the release
+        if: hashFiles('data/ah_summary.json') != ''
+        run: |
+          stamp=$(date -u +'%Y%m%d.%H%M')
+          zip="FlipLists-$stamp-forever.zip"
+          (cd dist && zip -qr "../$zip" FlipLists)
+          gh release create "v$stamp" "$zip" --title "FlipLists $stamp" \
+            --notes "Snipe caps and prices from the AH snapshot of $(date -u +'%Y-%m-%d %H:%M') UTC."
+          gh release list --limit 100 --exclude-drafts --json tagName,createdAt \
+            -q 'map(select(.tagName != "seed")) | sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
+            xargs -r -n1 gh release delete --yes --cleanup-tag
+        env:
+          GH_TOKEN: ${{ github.token }}

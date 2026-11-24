@@ -1,0 +1,7 @@
+# Copy to config.toml and fill in. config.toml is gitignored.
+# Only needed to run the scripts locally: the GitHub Action uses repository secrets instead.
+
+[battlenet]
+# Create a client at https://develop.battle.net/access/clients
+client_id = ""
+client_secret = ""

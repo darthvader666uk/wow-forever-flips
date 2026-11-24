@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[oc]
+.venv
+.pytest_cache/
+
+# Local state: personal data and tokens, never commit
+config.toml
+data/*
+!data/.gitkeep
+
+# Local reference docs (Forever UI source and API lists), refreshed with git pull
+.vscode/docs/
+
+# Build output (the release zip is made from it)
+dist/
