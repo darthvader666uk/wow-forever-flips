@@ -131,6 +131,11 @@ def pull(house):
     rows = [(a["id"], a["item"]["id"], a["quantity"], a["buyout"] // a["quantity"], a["time_left"])
             for a in items[1] if a.get("buyout")]  # bid-only listings have no buyout
     rows += [(a["id"], a["item"]["id"], a["quantity"], a["unit_price"], a["time_left"]) for a in commodities[1]]
+    # Blizzard's snapshot sometimes lists an auction id twice, which broke the seen table's primary key
+    unique = list({r[0]: r for r in rows}.values())
+    if len(unique) < len(rows):
+        print(f"{HOUSES[house]}: dropped {len(rows) - len(unique)} duplicate auction ids")
+    rows = unique
 
     by_item = {}
     for _, item, qty, unit, _ in rows:
