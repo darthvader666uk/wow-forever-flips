@@ -1,6 +1,6 @@
-# Hourly WoW Forever (EU) auction house pull, then a FlipLists release built from it.
-# The database lives in the Actions cache. The small summary is force-pushed to the ah-data
-# branch as a single commit, so history never grows. Each new snapshot publishes a release
+# Hourly WoW Forever (EU) auction house pull (all 8 houses), then a FlipLists release built from it.
+# The databases live in the Actions cache. The small per-house summaries are force-pushed to the
+# ah-data branch as a single commit, so history never grows. Each new snapshot publishes a release
 # whose zip WowUp installs (the -forever.zip suffix tells WowUp it is for Forever).
 name: AH pull and release
 
@@ -20,7 +20,7 @@ concurrency:
 jobs:
   pull:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
@@ -28,13 +28,14 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: |
-            data/ah.sqlite
+            data/ah-*.sqlite
             data/item_ids.json
           key: ah-db-${{ github.run_id }}
           restore-keys: ah-db-
 
       # First run only: start from the seed database (a prerelease tagged "seed"), so the
-      # caps have a week of history instead of none
+      # caps have a week of history instead of none. The seed is Normal Alliance only (ah.sqlite,
+      # renamed to ah-111.sqlite on the first pull): the other houses start empty
       - name: Seed the database
         if: steps.restore.outputs.cache-matched-key == ''
         run: gh release download seed -D data -R "$GITHUB_REPOSITORY" || echo "no seed release, starting empty"
@@ -47,39 +48,44 @@ jobs:
           BLIZZARD_CLIENT_ID: ${{ secrets.BLIZZARD_CLIENT_ID }}
           BLIZZARD_CLIENT_SECRET: ${{ secrets.BLIZZARD_CLIENT_SECRET }}
 
-      # The summary file only exists when a new snapshot was stored, so skip the rest otherwise.
+      # A house's summary file only exists when a new snapshot was stored, so skip the rest
+      # when no house had one. sync_lists.py takes the others from the ah-data branch.
       - name: Build the addon
-        if: hashFiles('data/ah_summary.json') != ''
+        if: hashFiles('data/ah_summary-*.json') != ''
         run: python3 sync_lists.py
         env:
           BLIZZARD_CLIENT_ID: ${{ secrets.BLIZZARD_CLIENT_ID }}
           BLIZZARD_CLIENT_SECRET: ${{ secrets.BLIZZARD_CLIENT_SECRET }}
 
-      - if: hashFiles('data/ah_summary.json') != ''
+      - if: hashFiles('data/ah_summary-*.json') != ''
         uses: actions/cache/save@v6
         with:
           path: |
-            data/ah.sqlite
+            data/ah-*.sqlite
             data/item_ids.json
           key: ah-db-${{ github.run_id }}
 
       - name: Delete the previous database cache
         # The last check stops a re-run of the same run deleting the cache it just restored.
         if: >-
-          hashFiles('data/ah_summary.json') != '' &&
+          hashFiles('data/ah_summary-*.json') != '' &&
           steps.restore.outputs.cache-matched-key != '' &&
           steps.restore.outputs.cache-matched-key != format('ah-db-{0}', github.run_id)
         run: gh cache delete "${{ steps.restore.outputs.cache-matched-key }}" -R "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}
 
-      - name: Push the summary to the ah-data branch
-        if: hashFiles('data/ah_summary.json') != ''
+      - name: Push the summaries to the ah-data branch
+        if: hashFiles('data/ah_summary-*.json') != ''
         run: |
           out="$RUNNER_TEMP/ah-data"
-          mkdir "$out" && cp data/ah_summary.json "$out/" && cd "$out"
+          mkdir "$out"
+          # keep the houses that had no new snapshot this run, then add the new ones
+          git fetch -q origin ah-data && git archive origin/ah-data | tar -x -C "$out" || true
+          rm -f "$out/ah_summary.json"  # the old single-house name
+          cp data/ah_summary-*.json "$out/" && cd "$out"
           git init -q -b ah-data
-          git add ah_summary.json
+          git add -A
           git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
             commit -qm "AH summary $(date -u +'%Y-%m-%d %H:%M')"
           git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:ah-data
@@ -89,7 +95,7 @@ jobs:
       # WowUp reads the version from the zip's file name, so every release needs a new name.
       # Only the newest 5 releases are kept (WowUp only looks at 5). The seed is never deleted.
       - name: Publish the release
-        if: hashFiles('data/ah_summary.json') != ''
+        if: hashFiles('data/ah_summary-*.json') != ''
         run: |
           stamp=$(date -u +'%Y%m%d.%H%M')
           zip="FlipLists-$stamp-forever.zip"

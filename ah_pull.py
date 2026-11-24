@@ -1,9 +1,9 @@
-"""Hourly pull of the WoW Forever (EU) auction house from the Blizzard API into data/ah.sqlite,
+"""Hourly pull of the WoW Forever (EU) auction houses from the Blizzard API into data/ah-<house>.sqlite,
 plus a report for re-ranking the snipe list. Runs hourly on GitHub Actions
-(.github/workflows/wow-ah-pull.yml), which pushes data/ah_summary.json to the ah-data branch.
+(.github/workflows/pull.yml), which pushes data/ah_summary-<house>.json to the ah-data branch.
 
-  python3 ah_pull.py               store the latest snapshot (skips one already stored)
-  python3 ah_pull.py report [cap]  snipe-list check and the best items not on it (cap in copper, default 1g)
+  python3 ah_pull.py                       store the latest snapshot of every house (skips ones already stored)
+  python3 ah_pull.py report [cap] [house]  snipe-list check and the best items not on it (cap in copper, default 1g)
 
 Blizzard has no sales data, so sales are estimated from listings that vanish between hourly
 pulls while they still had 2h+ left (bought or cancelled, not expired). Treat it as a guide.
@@ -21,17 +21,33 @@ from email.utils import parsedate_to_datetime
 
 import blizzard
 
-RULESET, HOUSE = 2, 111  # Normal, Alliance: matched exactly against TSM's Normal-Alliance data 2026-11-20
-DB = blizzard.HERE / "data" / "ah.sqlite"
-SUMMARY = blizzard.HERE / "data" / "ah_summary.json"
+# Forever has one auction house per realm type and faction. The ruleset in the URL makes no
+# difference (every ruleset lists the same 15 houses), so 2 is used for all of them. Mapping from
+# Umbral Market, and 111 matched TSM's Normal-Alliance data exactly 2026-11-20. The Blackwater
+# (neutral) houses and the empty reserved ones are skipped. The addon has the same table (HOUSES).
+RULESET = 2
+HOUSES = {111: "Normal Alliance", 114: "Normal Horde", 110: "PvP Alliance", 113: "PvP Horde",
+          119: "RP Alliance", 120: "RP Horde", 123: "RP-PvP Alliance", 124: "RP-PvP Horde"}
+DEFAULT = 111  # pulled first: the other houses copy its vendor prices, and the report uses it
+DATA = blizzard.HERE / "data"
+
+
+def db_path(house):
+    return DATA / f"ah-{house}.sqlite"
+
+
+def summary_path(house):
+    return DATA / f"ah_summary-{house}.json"
+
+
 KEEP_DAYS = 14
 STILL_LIVE = {"LONG", "VERY_LONG"}
 MAX_GAP = 90 * 60  # longer gap between pulls (PC off) and LONG listings may have expired, so no sales estimate
 
 
-def fetch(path, since):
+def fetch(house, path, since):
     """(Last-Modified epoch, auctions) or None if Blizzard says nothing changed."""
-    url = f"{blizzard.API}/ruleset/{RULESET}/auctions/{HOUSE}{path}?namespace=dynamic-forever-eu"
+    url = f"{blizzard.API}/ruleset/{RULESET}/auctions/{house}{path}?namespace=dynamic-forever-eu"
     headers = {"Authorization": "Bearer " + blizzard.token()}
     if since:
         headers["If-Modified-Since"] = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(since))
@@ -47,8 +63,11 @@ def fetch(path, since):
     return int(parsedate_to_datetime(r.headers["Last-Modified"]).timestamp()), body["auctions"]
 
 
-def connect():
-    db = sqlite3.connect(DB)
+def connect(house):
+    old = DATA / "ah.sqlite"  # the single-house name, still used by the seed release
+    if house == DEFAULT and old.exists() and not db_path(house).exists():
+        old.rename(db_path(house))
+    db = sqlite3.connect(db_path(house))
     db.executescript("""
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER);
         CREATE TABLE IF NOT EXISTS snap (ts INTEGER, item INTEGER, min INTEGER, median INTEGER, qty INTEGER, n INTEGER,
@@ -63,6 +82,11 @@ def connect():
         db.execute("ALTER TABLE seen ADD COLUMN old INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass
+    if house != DEFAULT and db_path(DEFAULT).exists():  # vendor prices are the same everywhere
+        db.execute("ATTACH ? AS src", (str(db_path(DEFAULT)),))
+        db.execute("INSERT OR IGNORE INTO vendor SELECT * FROM src.vendor")
+        db.commit()
+        db.execute("DETACH src")
     return db
 
 
@@ -96,12 +120,12 @@ def vendor_prices(db, items, commodity_items):
     return known
 
 
-def pull():
-    db = connect()
+def pull(house):
+    db = connect(house)
     last = (db.execute("SELECT value FROM meta WHERE key='last_modified'").fetchone() or [0])[0]
-    items, commodities = fetch("", last), fetch("/commodities", last)
+    items, commodities = fetch(house, "", last), fetch(house, "/commodities", last)
     if items is None or commodities is None or max(items[0], commodities[0]) <= last:
-        print("no new snapshot since", time.strftime("%H:%M", time.localtime(last)))
+        print(f"{HOUSES[house]}: no new snapshot since", time.strftime("%H:%M", time.localtime(last)))
         return
     ts = max(items[0], commodities[0])
     rows = [(a["id"], a["item"]["id"], a["quantity"], a["buyout"] // a["quantity"], a["time_left"])
@@ -156,12 +180,13 @@ def pull():
     db.execute("DELETE FROM sold WHERE ts < ?", (cutoff,))
     db.execute("DELETE FROM vdeal WHERE ts < ?", (cutoff,))
     db.commit()
-    summarise(db)
-    print(time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)), f"{len(rows)} listings, {len(summary)} items stored")
+    summarise(db, house)
+    print(f"{HOUSES[house]}:", time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)),
+          f"{len(rows)} listings, {len(summary)} items stored")
 
 
-def summarise(db):
-    """Per-item figures for the last 7 days, written to SUMMARY: the small file the report
+def summarise(db, house):
+    """Per-item figures for the last 7 days, written to the house's summary: the small file the report
     (and later an addon) reads, so the database itself can stay on GitHub."""
     week = time.time() - 7 * 86400
     snaps = db.execute("SELECT COUNT(DISTINCT ts) FROM snap WHERE ts >= ?", (week,)).fetchone()[0]
@@ -181,22 +206,31 @@ def summarise(db):
             "SELECT d.item, v.price, v.commodity, SUM(listings), SUM(lasted), SUM(lasted_profit) FROM vdeal d "
             "JOIN vendor v ON v.item = d.item WHERE ts >= ? GROUP BY d.item", (week,)):
         vendor[item] = [price, comm, n, lasted, profit]
-    SUMMARY.write_text(json.dumps({"updated": latest, "snapshots": snaps, "sale_hours": sale_hours, "items": items,
+    summary_path(house).write_text(json.dumps({"updated": latest, "snapshots": snaps, "sale_hours": sale_hours, "items": items,
                                    "vendor": vendor},
                                   separators=(",", ":")))
 
 
-def load_summary():
+_fetched = False
+
+
+def load_summary(house=DEFAULT):
     """The newer of the GitHub Action's summary (ah-data branch) and the local timer's file."""
+    global _fetched
     found = []
     try:
-        subprocess.run(["git", "-C", blizzard.HERE, "fetch", "-q", "origin", "ah-data"], check=True, capture_output=True)
-        found.append((subprocess.run(["git", "-C", blizzard.HERE, "show", "origin/ah-data:ah_summary.json"],
+        if not _fetched:
+            _fetched = True
+            subprocess.run(["git", "-C", blizzard.HERE, "fetch", "-q", "origin", "ah-data"], check=True, capture_output=True)
+        found.append((subprocess.run(["git", "-C", blizzard.HERE, "show", f"origin/ah-data:{summary_path(house).name}"],
                                      check=True, capture_output=True, text=True).stdout, "GitHub (ah-data branch)"))
     except subprocess.CalledProcessError:
         pass
-    if SUMMARY.exists():
-        found.append((SUMMARY.read_text(), "local"))
+    old = DATA / "ah_summary.json"  # the single-house name
+    if house == DEFAULT and old.exists() and not summary_path(house).exists():
+        old.rename(summary_path(house))
+    if summary_path(house).exists():
+        found.append((summary_path(house).read_text(), "local"))
     if not found:
         return None, None
     data, source = max(((json.loads(t), src) for t, src in found), key=lambda f: (f[0]["updated"], f[0]["snapshots"]))
@@ -204,13 +238,13 @@ def load_summary():
     return data, source
 
 
-def report(cap):
-    data, source = load_summary()
+def report(cap, house):
+    data, source = load_summary(house)
     if not data:
         print("no summary yet, run: python3 ah_pull.py")
         return
     items = data["items"]
-    print(f"{source}, snapshot {time.strftime('%a %H:%M', time.localtime(data['updated']))}: "
+    print(f"{HOUSES[house]} {source}, snapshot {time.strftime('%a %H:%M', time.localtime(data['updated']))}: "
           f"{data['snapshots']} snapshots, {data['sale_hours']} with sales estimates (firms up after a day or two)")
     print("listed = median listing price, sold at = average price of listings that sold\n")
     snipe = next(l for l in blizzard.HERE.joinpath("lists.txt").read_text().splitlines()
@@ -251,6 +285,7 @@ def report(cap):
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["report"]:
-        report(int(sys.argv[2]) if len(sys.argv) > 2 else 10000)
+        report(int(sys.argv[2]) if len(sys.argv) > 2 else 10000, int(sys.argv[3]) if len(sys.argv) > 3 else DEFAULT)
     else:
-        pull()
+        for h in HOUSES:
+            pull(h)

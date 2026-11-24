@@ -6,7 +6,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-from ah_pull import load_summary
+from ah_pull import DEFAULT, HOUSES, db_path, load_summary
 from blizzard import item_ids, money
 
 HERE = Path(__file__).parent
@@ -20,6 +20,7 @@ TOC = """## Interface: 16001
 ## Dependencies: Auctionator
 ## OptionalDeps: PointBlankSniper
 ## SavedVariables: FlipListsDB
+## SavedVariablesPerCharacter: FlipListsCharDB
 Lists.lua
 FlipLists.lua
 Tab.xml
@@ -54,15 +55,37 @@ stale:SetScript("OnEvent", function()
   end
 end)
 
-f:SetScript("OnEvent", function()
+-- Forever has one auction house per realm type and faction, and Lists.lua carries the snipe
+-- caps and prices of each (FlipLists_Houses). The game does not tell addons the realm type, so
+-- it is picked once per character in the settings (Normal until then). Faction is automatic.
+-- Same mapping as HOUSES in ah_pull.py: {Alliance, Horde}.
+local HOUSES = {Normal = {111, 114}, PvP = {110, 113}, RP = {119, 120}, ["RP-PvP"] = {123, 124}}
+local RULESETS = {"Normal", "PvP", "RP", "RP-PvP"}
+
+local function LoadLists()
+  FlipListsCharDB = FlipListsCharDB or {}
+  local ruleset = HOUSES[FlipListsCharDB.ruleset] and FlipListsCharDB.ruleset or "Normal"
+  local faction = UnitFactionGroup("player") == "Horde" and "Horde" or "Alliance"
+  local house = FlipLists_Houses[HOUSES[ruleset][faction == "Horde" and 2 or 1]] or {}
+  FlipLists_Prices, FlipLists_Updated = house.prices or {}, house.updated
   local names = {}
   for name, items in pairs(FlipLists_Data) do
+    if name == "Flip Snipe" and house.snipe then items = house.snipe end  -- the same items, with caps
     Auctionator.API.v1.CreateShoppingList("FlipLists", name, items)
     table.insert(names, name .. " (" .. #items .. ")")
   end
   table.sort(names)
-  local from = FlipLists_Updated and (", AH data from " .. date("%H:%M", FlipLists_Updated)) or ""
+  local from = FlipLists_Updated and (", " .. ruleset .. " " .. faction .. " AH data from " ..
+    date("%H:%M", FlipLists_Updated)) or (", no " .. ruleset .. " " .. faction .. " AH data yet")
   print("|cff00ff00Flip Lists:|r updated " .. table.concat(names, ", ") .. from)
+  if not FlipListsCharDB.ruleset then
+    print("|cffffff00Flip Lists:|r using Normal realm prices. If your realm is PvP, RP or RP-PvP, " ..
+      "pick it once in Esc > Options > AddOns > Flip Lists.")
+  end
+end
+
+f:SetScript("OnEvent", function()
+  LoadLists()
 
   local blacklist = PointBlankSniper and PointBlankSniper.Constants.VendorBlacklist
   if blacklist then
@@ -466,13 +489,176 @@ local function Build()
   view = MakeView(content, -34, WINDOW_ROWS)
 end
 
-SLASH_FLIPLISTS1 = "/flips"
-SlashCmdList.FLIPLISTS = function()
+local function ToggleFlips()
   if report and report:IsShown() then return report:Hide() end
   if not report then Build() end
   Fill(view)
   report:Show()
 end
+
+-- Export: addons cannot write files, so the ledger is shown as CSV in a text box, already
+-- selected, for Ctrl+C. One row per buy or sale: copper each is after the 5% AH cut for sales.
+local export
+local function ExportCSV()
+  local db = FlipListsDB or {}
+  local lines = {"type,date,item id,item name,quantity,copper each"}
+  for _, kind in ipairs({"buys", "sales"}) do
+    for _, r in ipairs(db[kind] or {}) do
+      local name = (C_Item.GetItemInfo(r[2]) or ""):gsub('"', '""')
+      tinsert(lines, format('%s,%s,%d,"%s",%d,%d', kind == "buys" and "buy" or "sale",
+        date("%Y-%m-%d %H:%M", r[1]), r[2], name, r[3], r[4]))
+    end
+  end
+  if not export then
+    export = CreateFrame("Frame", "FlipListsExportFrame", UIParent, "BasicFrameTemplateWithInset")
+    export:SetSize(620, 420)
+    export:SetPoint("CENTER")
+    export:SetFrameStrata("DIALOG")
+    export:SetMovable(true)
+    export:EnableMouse(true)
+    export:RegisterForDrag("LeftButton")
+    export:SetScript("OnDragStart", export.StartMoving)
+    export:SetScript("OnDragStop", export.StopMovingOrSizing)
+    tinsert(UISpecialFrames, "FlipListsExportFrame")
+    export.title = export:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    export.title:SetPoint("TOP", 0, -5)
+    local scroll = CreateFrame("ScrollFrame", nil, export, "UIPanelScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT", 12, -30)
+    scroll:SetPoint("BOTTOMRIGHT", -32, 12)
+    export.box = CreateFrame("EditBox", nil, scroll)
+    export.box:SetMultiLine(true)
+    export.box:SetFontObject(ChatFontNormal)
+    export.box:SetWidth(570)
+    export.box:SetAutoFocus(false)
+    export.box:SetScript("OnEscapePressed", function() export:Hide() end)
+    scroll:SetScrollChild(export.box)
+  end
+  export.title:SetText("Flips export: " .. (#lines - 1) .. " rows. Ctrl+C to copy, paste into a spreadsheet")
+  export.box:SetText(table.concat(lines, "\n"))
+  export:Show()
+  export.box:SetFocus()
+  export.box:HighlightText()
+end
+
+SLASH_FLIPLISTS1 = "/flips"
+SlashCmdList.FLIPLISTS = function(msg)
+  if (msg or ""):lower():match("^%s*export") then return ExportCSV() end
+  ToggleFlips()
+end
+
+-- Minimap button: click opens Flips, drag moves it around the minimap ring. Its angle and
+-- whether it is hidden are saved in FlipListsDB.minimap.
+local mini
+local function MiniPlace()
+  local a = math.rad(FlipListsDB.minimap.angle or 200)
+  local r = Minimap:GetWidth() / 2 + 6
+  mini:ClearAllPoints()
+  mini:SetPoint("CENTER", Minimap, "CENTER", math.cos(a) * r, math.sin(a) * r)
+end
+local function MiniButton()
+  FlipListsDB.minimap = FlipListsDB.minimap or {}
+  if mini then return mini:SetShown(not FlipListsDB.minimap.hide) end
+  mini = CreateFrame("Button", "FlipListsMinimapButton", Minimap)
+  mini:SetSize(31, 31)
+  mini:SetFrameStrata("MEDIUM")
+  mini:SetFrameLevel(8)
+  mini:SetHighlightTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
+  local icon = mini:CreateTexture(nil, "BACKGROUND")
+  icon:SetTexture("Interface\\Icons\\INV_Misc_Coin_02")
+  icon:SetSize(20, 20)
+  icon:SetPoint("TOPLEFT", 7, -5)
+  local border = mini:CreateTexture(nil, "OVERLAY")
+  border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
+  border:SetSize(53, 53)
+  border:SetPoint("TOPLEFT")
+  mini:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+  mini:RegisterForDrag("LeftButton")
+  mini:SetScript("OnClick", function(_, button)
+    if button == "RightButton" then ExportCSV() else ToggleFlips() end
+  end)
+  mini:SetScript("OnDragStart", function(self)
+    self:SetScript("OnUpdate", function()
+      local mx, my = Minimap:GetCenter()
+      local x, y = GetCursorPosition()
+      local scale = Minimap:GetEffectiveScale()
+      FlipListsDB.minimap.angle = math.deg(math.atan2(y / scale - my, x / scale - mx))
+      MiniPlace()
+    end)
+  end)
+  mini:SetScript("OnDragStop", function(self) self:SetScript("OnUpdate", nil) end)
+  mini:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+    GameTooltip:AddLine("Flip Lists")
+    GameTooltip:AddLine("Click: Flips. Right-click: export. Drag: move.", 1, 1, 1)
+    GameTooltip:Show()
+  end)
+  mini:SetScript("OnLeave", GameTooltip_Hide)
+  MiniPlace()
+  mini:SetShown(not FlipListsDB.minimap.hide)
+end
+
+-- Settings panel (Esc > Options > AddOns > Flip Lists): minimap button on/off and export.
+local function SettingsPanel()
+  local panel = CreateFrame("Frame")
+  panel.name = "Flip Lists"
+  local title = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+  title:SetPoint("TOPLEFT", 16, -16)
+  title:SetText("Flip Lists")
+  local show = CreateFrame("CheckButton", nil, panel, "UICheckButtonTemplate")
+  show:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -12)
+  show.Text = show.Text or show:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+  show.Text:SetPoint("LEFT", show, "RIGHT", 4, 0)
+  show.Text:SetText("Show the minimap button")
+  show:SetScript("OnShow", function(self) self:SetChecked(not FlipListsDB.minimap.hide) end)
+  show:SetScript("OnClick", function(self)
+    FlipListsDB.minimap.hide = not self:GetChecked()
+    MiniButton()
+  end)
+  local btn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+  btn:SetPoint("TOPLEFT", show, "BOTTOMLEFT", 0, -16)
+  btn:SetSize(200, 24)
+  btn:SetText("Export Flips (CSV)")
+  btn:SetScript("OnClick", ExportCSV)
+  local hint = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+  hint:SetPoint("TOPLEFT", btn, "BOTTOMLEFT", 0, -8)
+  hint:SetText("Every buy and sale in your Flips ledger. Also: /flips export")
+  -- Realm type, one tickbox each (only one stays ticked). Saved per character, applied at once.
+  local rs = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+  rs:SetPoint("TOPLEFT", hint, "BOTTOMLEFT", 0, -24)
+  rs:SetText("Realm type for this character (your faction is picked for you)")
+  local boxes, prev = {}, rs
+  for _, name in ipairs(RULESETS) do
+    local b = CreateFrame("CheckButton", nil, panel, "UICheckButtonTemplate")
+    b:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, prev == rs and -8 or 0)
+    b.Text = b.Text or b:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    b.Text:SetPoint("LEFT", b, "RIGHT", 4, 0)
+    b.Text:SetText(name)
+    b:SetScript("OnShow", function(self) self:SetChecked((FlipListsCharDB.ruleset or "Normal") == name) end)
+    b:SetScript("OnClick", function(self)
+      for _, o in ipairs(boxes) do o:SetChecked(o == self) end
+      FlipListsCharDB.ruleset = name
+      LoadLists()
+    end)
+    table.insert(boxes, b)
+    prev = b
+  end
+  local note = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+  note:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, -8)
+  note:SetText("Picks which auction house the snipe caps and prices come from. Rebuilds the lists straight away.")
+  if Settings and Settings.RegisterCanvasLayoutCategory then
+    Settings.RegisterAddOnCategory(Settings.RegisterCanvasLayoutCategory(panel, panel.name))
+  elseif InterfaceOptions_AddCategory then
+    InterfaceOptions_AddCategory(panel)
+  end
+end
+
+local ui = CreateFrame("Frame")
+ui:RegisterEvent("PLAYER_LOGIN")
+ui:SetScript("OnEvent", function()
+  FlipListsDB = FlipListsDB or {}
+  MiniButton()
+  SettingsPanel()
+end)
 
 -- A "Flips" tab in the auction house, after Sniping (tabOrder 6). Auctionator builds its tabs
 -- when the AH first opens, from this list sorted by tabOrder. TSM adds its own tab after them.
@@ -717,6 +903,9 @@ local function IdByName(name)
   for _, r in ipairs(FlipListsDB.buys) do
     if r[2] > 0 and C_Item.GetItemInfo(r[2]) == name then return r[2] end
   end
+  for id in pairs(FlipListsDB.posted or {}) do
+    if C_Item.GetItemInfo(id) == name then return id end
+  end
 end
 
 local function FreeSlots()
@@ -828,6 +1017,9 @@ ledger:SetScript("OnEvent", function(_, event)
       if id and a.status == active then posted[id] = (posted[id] or 0) + (a.quantity or 1) end
     end
     FlipListsDB.posted = posted
+    -- A sale mail only names the item, and the name lookup fails for gear the game has not
+    -- cached (seen 2026-11-24: 4 gear sales saved as item 0). Load every listed item now.
+    for id in pairs(posted) do C_Item.RequestLoadItemDataByID(id) end
     Changed()
     return
   end
@@ -878,7 +1070,7 @@ TAB_XML = """<Ui xmlns="http://www.blizzard.com/wow/ui/">
 MIN_SALE_HOURS = 24  # hours of sales estimates from ah_pull.py before its prices are trusted
 
 
-def cap_skewed(items, data, source):
+def cap_skewed(items, data, source, where):
     """Point Blank Sniper uses a term's max price instead of its price source. Once ah_pull.py
     has a day of sales estimates, every item it has seen sell gets a max price of 70% of the
     lowest of its sold-at price, its typical listing price (sold-at counts cancels too, so it
@@ -886,7 +1078,7 @@ def cap_skewed(items, data, source):
     market). Items with no sales yet keep no max price, so PBS uses its price source."""
     own = data["items"] if data and data["sale_hours"] >= MIN_SALE_HOURS else {}
     if data and not own:
-        print(f"    own AH prices: {data['sale_hours']} of {MIN_SALE_HOURS} hours of sales so far, no caps yet")
+        print(f"    {where}: {data['sale_hours']} of {MIN_SALE_HOURS} hours of sales so far, no caps yet")
     out, mine = [], 0
     for term in items:
         ids = item_ids(term.strip('"'))
@@ -899,7 +1091,7 @@ def cap_skewed(items, data, source):
         else:
             out.append(term)
     if own:
-        print(f"    {mine} of {len(items)} max prices from own AH data ({source}, {data['sale_hours']} hours of sales)")
+        print(f"    {where}: {mine} of {len(items)} max prices from own AH data ({source}, {data['sale_hours']} hours of sales)")
     return out
 
 
@@ -909,26 +1101,31 @@ def main():
         if "^" in line:
             name, *items = line.split("^")
             lists[name] = items
-    data, source = load_summary()  # once: it runs a git fetch
-    lists["Flip Snipe"] = cap_skewed(lists["Flip Snipe"], data, source)
     # json.dumps gives a valid Lua string literal for these ASCII names
-    body = "".join(f"  [{json.dumps(n)}] = {{{', '.join(json.dumps(i) for i in items)}}},\n"
-                   for n, items in lists.items())
+    terms = lambda items: ", ".join(json.dumps(i) for i in items)
+    body = "".join(f"  [{json.dumps(n)}] = {{{terms(items)}}},\n" for n, items in lists.items())
+    # Per house: Flip Snipe with that house's max prices, and its own price per item for Best exit
+    # and the selling floor: the lower of listed and sold at, since sold at counts cancelled
+    # pricey listings and can read 10x high. Houses with no data yet are left out (no caps).
+    houses = ""
+    for house, where in HOUSES.items():
+        data, source = load_summary(house)
+        if not data:
+            continue
+        own = {i: int(min(v[0], v[1]) if v[0] else v[1]) for i, v in data["items"].items() if v[1]}
+        houses += (f"  [{house}] = {{updated = {int(data['updated'])},\n"
+                   f"    snipe = {{{terms(cap_skewed(lists['Flip Snipe'], data, source, where))}}},\n"
+                   f"    prices = {{{''.join(f'[{i}]={p},' for i, p in sorted(own.items()))}}}}},\n")
     ADDON.mkdir(parents=True, exist_ok=True)
     (ADDON / "FlipLists.toc").write_text(TOC)
     (ADDON / "FlipLists.lua").write_text(MAIN)
     (ADDON / "Tab.xml").write_text(TAB_XML)
-    # Our own EU house price per item for Best exit in game: the lower of listed and sold at,
-    # since sold at counts cancelled pricey listings and can read 10x high
-    own = {i: int(min(v[0], v[1]) if v[0] else v[1]) for i, v in (data or {}).get("items", {}).items() if v[1]}
-    price_body = "".join(f"[{i}]={p}," for i, p in sorted(own.items()))
     # Vendor prices for the Flip Vendor scan and Best exit, so they work for uncached items too
-    with sqlite3.connect(HERE / "data" / "ah.sqlite") as db:
+    with sqlite3.connect(db_path(DEFAULT)) as db:
         vendor = db.execute("SELECT item, price FROM vendor WHERE price > 0 ORDER BY item").fetchall()
     vendor_body = "".join(f"[{i}]={p}," for i, p in vendor)
-    (ADDON / "Lists.lua").write_text("FlipLists_Data = {\n" + body + "}\nFlipLists_Prices = {" + price_body +
-                                       "}\nFlipLists_Vendor = {" + vendor_body + "}\n" +
-                                       f"FlipLists_Updated = {int((data or {}).get('updated') or 0) or 'nil'}\n")
+    (ADDON / "Lists.lua").write_text("FlipLists_Data = {\n" + body + "}\nFlipLists_Houses = {\n" + houses +
+                                       "}\nFlipLists_Vendor = {" + vendor_body + "}\n")
     for n, items in lists.items():
         print(f"  {n}: {len(items)} items")
     print(f"Written to {ADDON}. In game: /reload")
