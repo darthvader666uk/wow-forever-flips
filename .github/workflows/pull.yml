@@ -42,7 +42,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # A house that fails does not stop the others or the release: the last step turns the run red
       - name: Pull the latest snapshot
+        id: pull
+        continue-on-error: true
         run: python3 ah_pull.py
         env:
           BLIZZARD_CLIENT_ID: ${{ secrets.BLIZZARD_CLIENT_ID }}
@@ -94,6 +97,7 @@ jobs:
 
       # WowUp reads the version from the zip's file name, so every release needs a new name.
       # Only the newest 5 releases are kept (WowUp only looks at 5). The seed is never deleted.
+      # Sort by publishedAt: createdAt is the commit's date, the same for every release of a commit.
       - name: Publish the release
         if: hashFiles('data/ah_summary-*.json') != ''
         run: |
@@ -102,8 +106,12 @@ jobs:
           (cd dist && zip -qr "../$zip" FlipLists)
           gh release create "v$stamp" "$zip" --title "FlipLists $stamp" \
             --notes "Snipe caps and prices from the AH snapshot of $(date -u +'%Y-%m-%d %H:%M') UTC."
-          gh release list --limit 100 --exclude-drafts --json tagName,createdAt \
-            -q 'map(select(.tagName != "seed")) | sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
+          gh release list --limit 100 --exclude-drafts --json tagName,publishedAt \
+            -q 'map(select(.tagName != "seed")) | sort_by(.publishedAt) | reverse | .[5:] | .[].tagName' |
             xargs -r -n1 gh release delete --yes --cleanup-tag
         env:
           GH_TOKEN: ${{ github.token }}
+
+      - name: Fail the run if any house failed
+        if: steps.pull.outcome == 'failure'
+        run: echo "::error::a house failed, see the Pull the latest snapshot step" && exit 1

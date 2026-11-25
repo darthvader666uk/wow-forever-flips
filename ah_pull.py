@@ -14,9 +14,11 @@ import sqlite3
 import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from email.utils import parsedate_to_datetime
 
 import blizzard
@@ -120,8 +122,7 @@ def vendor_prices(db, items, commodity_items):
     return known
 
 
-def pull(house):
-    db = connect(house)
+def pull(house, db):
     last = (db.execute("SELECT value FROM meta WHERE key='last_modified'").fetchone() or [0])[0]
     items, commodities = fetch(house, "", last), fetch(house, "/commodities", last)
     if items is None or commodities is None or max(items[0], commodities[0]) <= last:
@@ -131,6 +132,11 @@ def pull(house):
     rows = [(a["id"], a["item"]["id"], a["quantity"], a["buyout"] // a["quantity"], a["time_left"])
             for a in items[1] if a.get("buyout")]  # bid-only listings have no buyout
     rows += [(a["id"], a["item"]["id"], a["quantity"], a["unit_price"], a["time_left"]) for a in commodities[1]]
+    # Blizzard's snapshot sometimes lists an auction id twice, which broke the seen table's primary key
+    unique = list({r[0]: r for r in rows}.values())
+    if len(unique) < len(rows):
+        print(f"{HOUSES[house]}: dropped {len(rows) - len(unique)} duplicate auction ids")
+    rows = unique
 
     by_item = {}
     for _, item, qty, unit, _ in rows:
@@ -287,5 +293,13 @@ if __name__ == "__main__":
     if sys.argv[1:2] == ["report"]:
         report(int(sys.argv[2]) if len(sys.argv) > 2 else 10000, int(sys.argv[3]) if len(sys.argv) > 3 else DEFAULT)
     else:
+        failed = []
         for h in HOUSES:
-            pull(h)
+            try:  # closing rolls back a half-done house, so it cannot lock the next one out
+                with closing(connect(h)) as db:
+                    pull(h, db)
+            except Exception:
+                failed.append(HOUSES[h])
+                traceback.print_exc()
+        if failed:
+            sys.exit("failed: " + ", ".join(failed))
