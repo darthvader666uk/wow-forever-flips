@@ -107,12 +107,37 @@ end
 -- "Sold" that follows it) without closing the next hit's panel.
 local starts, pressed = 0, -1
 local FAST = 0.2  -- nothing bought and nothing to wait for
-local function Restart(delay, from, check)
+-- It waits up to a second more for the AH to be ready, as a search sent while it is busy is lost.
+local function Restart(delay, from, check, tries)
   C_Timer.After(delay, function()
     local tab = PointBlankSniperTabFrame
-    if tab and tab:IsVisible() and starts == from and (not check or check()) then tab:Start() end
+    if not (tab and tab:IsVisible() and starts == from and (not check or check())) then return end
+    tries = tries or 0
+    if tries < 10 and not C_AuctionHouse.IsThrottledMessageSystemReady() then
+      Restart(0.1, from, check, tries + 1)
+    else
+      tab:Start()
+    end
   end)
 end
+
+-- PBS's Keys scan sends one search and waits for the answer, so a lost search leaves it on
+-- "Processing batch 1" for good, with the last results still showing. A round takes under a
+-- second, so start again after 2 with no answer. A stopped scan is not registered.
+local heard = 0
+local answers = CreateFrame("Frame")
+for _, event in ipairs({"AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", "AUCTION_HOUSE_BROWSE_RESULTS_ADDED"}) do
+  pcall(answers.RegisterEvent, answers, event)
+end
+answers:SetScript("OnEvent", function() heard = GetTime() end)
+C_Timer.NewTicker(0.5, function()
+  local tab = PointBlankSniperTabFrame
+  local scanner = tab and tab.Scanner
+  if scanner and tab:IsVisible() and scanner == tab.ScannerKeyCache and scanner.registered
+    and GetTime() - heard > 2 then
+    tab:Start()
+  end
+end)
 rescan:SetScript("OnEvent", function() Restart(1, pressed) end)
 
 -- While PBS's buy panel is open, the scroll wheel presses its Buy button. Each wheel click is
@@ -149,7 +174,9 @@ local function WireBuyPanel()
   hooksecurefunc(buy, "UpdateBuyState", function()
     if Gone() then Restart(pressed == starts and 1 or FAST, starts, Gone) end
   end)
-  hooksecurefunc(PointBlankSniperTabFrame, "Start", function() starts = starts + 1 end)
+  hooksecurefunc(PointBlankSniperTabFrame, "Start", function()
+    starts, heard = starts + 1, GetTime()
+  end)
 end
 local wire = CreateFrame("Frame")
 pcall(wire.RegisterEvent, wire, "AUCTION_HOUSE_SHOW")
