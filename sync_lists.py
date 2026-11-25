@@ -102,17 +102,18 @@ local rescan = CreateFrame("Frame")
 for _, event in ipairs({"COMMODITY_PURCHASE_SUCCEEDED", "AUCTION_HOUSE_PURCHASE_COMPLETED"}) do
   pcall(rescan.RegisterEvent, rescan, event)
 end
-local lastRestart = 0
-local function Restart()  -- a buy and the "Sold" that follows it can both ask, so start once
-  C_Timer.After(1, function()
+-- starts counts scans begun and pressed is its value when you last pressed Buy. A restart only
+-- happens if no scan has begun since the one it is for, so several things can ask (a buy and the
+-- "Sold" that follows it) without closing the next hit's panel.
+local starts, pressed = 0, -1
+local FAST = 0.2  -- nothing bought and nothing to wait for
+local function Restart(delay, from, check)
+  C_Timer.After(delay, function()
     local tab = PointBlankSniperTabFrame
-    if tab and tab:IsVisible() and GetTime() - lastRestart > 2 then
-      lastRestart = GetTime()
-      tab:Start()
-    end
+    if tab and tab:IsVisible() and starts == from and (not check or check()) then tab:Start() end
   end)
 end
-rescan:SetScript("OnEvent", Restart)
+rescan:SetScript("OnEvent", function() Restart(1, pressed) end)
 
 -- While PBS's buy panel is open, the scroll wheel presses its Buy button. Each wheel click is
 -- your own input, like clicking Buy, and PBS still refuses anything over the price cap. Also
@@ -136,15 +137,19 @@ local function WireBuyPanel()
   -- PBS never hears back when a gear buy fails (someone else got it first), so the button sits
   -- on "Buying..." for good. A buy that worked restarts the scan at 1s, so 2s means it failed.
   hooksecurefunc(buy, "BuyNow", function(self)
-    C_Timer.After(2, function()
-      if self:IsVisible() and self.BuyButton:GetText() == POINT_BLANK_SNIPER_L_BUYING then Restart() end
-    end)
+    pressed = starts
+    Restart(2, pressed, function() return self.BuyButton:GetText() == POINT_BLANK_SNIPER_L_BUYING end)
   end)
-  hooksecurefunc(buy, "UpdateBuyState", function(self)
-    if self.gotResult and not self.buyCommodity and self.BuyButton:GetText() == POINT_BLANK_SNIPER_L_SOLD then
-      Restart()
-    end
+  -- After pressing Buy, "Sold" also shows on a buy that worked, so give that one time to finish.
+  local function Gone()
+    local text = buy.BuyButton:GetText()
+    return buy.gotResult and not buy.buyCommodity
+      and (text == POINT_BLANK_SNIPER_L_SOLD or text == POINT_BLANK_SNIPER_L_BID_ONLY)
+  end
+  hooksecurefunc(buy, "UpdateBuyState", function()
+    if Gone() then Restart(pressed == starts and 1 or FAST, starts, Gone) end
   end)
+  hooksecurefunc(PointBlankSniperTabFrame, "Start", function() starts = starts + 1 end)
 end
 local wire = CreateFrame("Frame")
 pcall(wire.RegisterEvent, wire, "AUCTION_HOUSE_SHOW")
@@ -711,6 +716,42 @@ logStart:SetScript("OnEvent", function()
   end)
 end)
 
+-- A buy that failed: a red banner over the bottom of the sniper's results for 8 seconds, as the
+-- game only flashes "Internal auction error" and PBS says "Sold" either way. It sits on the tab,
+-- not the Buy panel, because the panel closes when the scan restarts.
+-- The failed buy is kept in lateBuy for a few seconds in case the game says it worked after all.
+local notBought, lateBuy
+local function BuyFailed(why, unsure)
+  local b, tab = pendingBuy, PointBlankSniperTabFrame
+  pendingBuy, lateBuy = nil, pendingBuy
+  b.failed = GetTime()
+  Restart(FAST, pressed)
+  if not (tab and tab.ResultsListing) then return end
+  if not notBought then
+    notBought = CreateFrame("Frame", nil, tab)
+    notBought:SetFrameLevel(tab.ResultsListing:GetFrameLevel() + 50)
+    notBought:SetPoint("BOTTOMLEFT", tab.ResultsListing, "BOTTOMLEFT", 0, 4)
+    notBought:SetPoint("BOTTOMRIGHT", tab.ResultsListing, "BOTTOMRIGHT", 0, 4)
+    notBought:SetHeight(76)
+    local bg = notBought:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    bg:SetColorTexture(0.45, 0, 0, 0.95)
+    notBought.title = notBought:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    notBought.title:SetPoint("TOPLEFT", 8, -8)
+    notBought.title:SetPoint("TOPRIGHT", -8, -8)
+    notBought.why = notBought:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    notBought.why:SetPoint("TOPLEFT", notBought.title, "BOTTOMLEFT", 0, -5)
+    notBought.why:SetPoint("TOPRIGHT", notBought.title, "BOTTOMRIGHT", 0, -5)
+  end
+  notBought.title:SetText((unsure and "MAYBE NOT BOUGHT: " or "NOT BOUGHT: ") .. b.qty .. "x " ..
+    (C_Item.GetItemInfo(b.id) or ("item " .. b.id)))
+  notBought.why:SetText(why)
+  notBought:Show()
+  C_Timer.After(8, function()
+    if lateBuy == b and not pendingBuy then notBought:Hide() end
+  end)
+end
+
 -- Point Blank Sniper's Buy button only starts a purchase, so note it here and log it when
 -- the purchase succeeds. Hooking the mixin works because PBS copies it into its buy frame
 -- when the AH first opens, after this file has loaded.
@@ -721,9 +762,47 @@ if PointBlankSniperBuyFrameMixin then
     local qty = self.ghostCount or r.quantity or 1
     local each = self.info.isCommodity and r.unitPrice or (r.buyoutAmount or 0) / math.max(qty, 1)
     local list = PointBlankSniper.Config.Get(PointBlankSniper.Config.Options.CURRENT_LIST)
-    pendingBuy = {id = key.itemID, qty = qty, each = each, list = list}
+    local b = {id = key.itemID, qty = qty, each = each, list = list}
+    pendingBuy = b
+    if notBought then notBought:Hide() end
+    C_Timer.After(4, function()
+      if pendingBuy == b then
+        BuyFailed("No reply from the auction house. Check your mail before buying it again.", true)
+      end
+    end)
+  end)
+  -- PBS drops a commodity buy without a word when the price went up after you pressed Buy
+  hooksecurefunc(C_AuctionHouse, "ConfirmCommoditiesPurchase", function()
+    if pendingBuy then pendingBuy.confirmed = true end
+  end)
+  hooksecurefunc(C_AuctionHouse, "CancelCommoditiesPurchase", function()
+    if pendingBuy and not pendingBuy.confirmed then
+      BuyFailed("Cancelled before paying: the price went up, it sold, or the Buy panel closed.")
+    end
   end)
 end
+
+-- What the game says when a buy fails, with a plainer reason for the vague ones
+local BUY_ERRORS = {}
+for name, why in pairs({
+  ERR_AUCTION_DATABASE_ERROR = "Someone most likely got there first.",
+  ERR_ITEM_NOT_FOUND = "Someone most likely got there first.",
+  ERR_AUCTION_HIGHER_BID = "", ERR_AUCTION_BID_OWN = "", ERR_NOT_ENOUGH_MONEY = "", ERR_ITEM_MAX_COUNT = "",
+}) do
+  if _G[name] then BUY_ERRORS[_G[name]] = why end
+end
+local buyErrors = CreateFrame("Frame")
+for _, event in ipairs({"UI_ERROR_MESSAGE", "COMMODITY_PURCHASE_FAILED", "COMMODITY_PRICE_UNAVAILABLE"}) do
+  pcall(buyErrors.RegisterEvent, buyErrors, event)
+end
+buyErrors:SetScript("OnEvent", function(_, event, _, msg)
+  if not pendingBuy then return end
+  if event ~= "UI_ERROR_MESSAGE" then
+    BuyFailed("The purchase failed. Someone most likely got there first.")
+  elseif BUY_ERRORS[msg] then
+    BuyFailed(msg:gsub("%.$", "") .. ". " .. BUY_ERRORS[msg])
+  end
+end)
 
 local function LogBuy(b)
   local name, link = C_Item.GetItemInfo(b.id)
@@ -747,9 +826,12 @@ logEvents:SetScript("OnEvent", function(_, event, msg)
     if soldPrefix and type(msg) == "string" and msg:sub(1, #soldPrefix) == soldPrefix then
       Log("|cff00ff00Sold on the AH:|r " .. msg:sub(#soldPrefix + 1):gsub("%.$", ""))
     end
-  elseif pendingBuy then
-    LogBuy(pendingBuy)
-    pendingBuy = nil
+  else
+    local b = pendingBuy or (lateBuy and GetTime() - lateBuy.failed < 8 and lateBuy)
+    if not b then return end
+    LogBuy(b)
+    if notBought then notBought:Hide() end
+    pendingBuy, lateBuy = nil, nil
   end
 end)
 

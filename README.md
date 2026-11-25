@@ -101,8 +101,18 @@ Never set the price source to None. Any item without a max price then counts as 
 
 A few extras while you snipe:
 - **Scroll wheel buys.** While the Buy panel is open, scrolling the mouse wheel presses Buy for you (it's still your input, and Point Blank Sniper still refuses anything over the max)
-- **"Sold" restarts the scan.** If someone beats you to it, scanning carries on instead of stalling
+- **A red NOT BOUGHT banner.** When a buy fails you get the item and the reason over the bottom of the results for 8 seconds (Point Blank Sniper says "Sold" either way, so it was hard to tell). If the game never answers it says MAYBE NOT BOUGHT, so check your mail before buying it again
+- **Straight back to scanning.** If it's already sold, bid only or the buy failed, the scan restarts 0.2 seconds later. A buy that MAY still be going through gets 1 to 2 seconds to finish first
 - **Rogue poisons are skipped.** Item data says merchants pay for them but, the Forever server wont buy them, so the 25 poisons are blocked from the vendor scan
+
+NOT BOUGHT reasons:
+
+| What it says | What happened |
+|---|---|
+| Internal auction error | Most likely someone got there first |
+| Cancelled before paying | The price went up, it sold, or the Buy panel closed |
+| The purchase failed | Most likely someone got there first |
+| Anything else | The game's own message (not enough gold etc.) |
 
 ## Selling
 
