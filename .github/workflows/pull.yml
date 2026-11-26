@@ -95,11 +95,32 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # The pull is hourly (sale estimates need every snapshot) but a release only goes out when the
+      # last one is nearly 3 hours old, or was built from older code. Caps 3 hours stale cost
+      # almost nothing (replayed 2026-11-26: no loss-making buys) and WowUp updates far less often.
+      - name: Check whether a release is due
+        id: due
+        if: hashFiles('data/ah_summary-*.json') != ''
+        run: |
+          last=$(gh release list --limit 20 --exclude-drafts --json tagName,publishedAt \
+            -q 'map(select(.tagName != "seed")) | sort_by(.publishedAt) | last | "\(.tagName) \(.publishedAt)"')
+          if [ -z "$last" ]; then echo "due=yes" >> "$GITHUB_OUTPUT"; exit 0; fi
+          set -- $last
+          age=$(( $(date +%s) - $(date -d "$2" +%s) ))
+          built=$(gh api "repos/$GITHUB_REPOSITORY/commits/$1" -q .sha)
+          if [ "$age" -ge $(( 170 * 60 )) ] || [ "$built" != "$GITHUB_SHA" ]; then
+            echo "due=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "last release $1 is $(( age / 60 )) minutes old and has this code, next one in about $(( 180 - age / 60 )) minutes"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       # WowUp reads the version from the zip's file name, so every release needs a new name.
       # Only the newest 5 releases are kept (WowUp only looks at 5). The seed is never deleted.
       # Sort by publishedAt: createdAt is the commit's date, the same for every release of a commit.
       - name: Publish the release
-        if: hashFiles('data/ah_summary-*.json') != ''
+        if: steps.due.outputs.due == 'yes'
         run: |
           stamp=$(date -u +'%Y%m%d.%H%M')
           zip="FlipLists-$stamp-forever.zip"

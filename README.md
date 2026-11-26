@@ -30,7 +30,7 @@ You should see this in chat:
 Flip Lists: updated Flip Herbs (35), Flip Skinning (39), Flip Snipe (81), Flip Vendor (1), Normal Alliance AH data from 14:22
 ```
 
-The end tells you which auction house the prices are from and when they were pulled. A new release goes out every hour, so let WowUp update it and `/reload` to pick up the new prices (addons cant re-read their files without a reload).
+The end tells you which auction house the prices are from and when they were pulled. A new release goes out every 3 hours, so let WowUp update it and `/reload` to pick up the new prices (addons cant re-read their files without a reload).
 
 ## Picking your realm type
 
@@ -60,7 +60,7 @@ Every hour a GitHub Action pulls all 8 Forever auction houses from the Blizzard 
 - **Sold at:** what it actually sold for (worked out from listings that disappear between pulls)
 - **Now:** the cheapest listing in the latest pull
 
-Then it builds the addon with every house's prices baked in (the addon only uses yours) and publishes it as a release. That's it, no app running on your PC and no TSM.
+Then it builds the addon with every house's prices baked in (the addon only uses yours) and publishes it as a release every 3 hours (or on the next pull after a code change). Caps that are 3 hours old cost almost nothing: replaying a day of my house's data, they flagged a few extra items that were still well under the selling floor and missed about 4c worth. That's it, no app running on your PC and no TSM.
 
 ## The shopping lists
 
@@ -182,7 +182,7 @@ The settings page also has a tickbox to hide the minimap button, and your realm 
 ## Is the data fresh?
 
 - The login line ends with `AH data from HH:MM`
-- When you open the AH, a red warning shows if your prices are more than 75 minutes old, so you know to update in WowUp and `/reload`
+- When you open the AH, a red warning shows if your prices are more than 3.5 hours old, so you know to update in WowUp and `/reload`
 
 ## Running it yourself
 

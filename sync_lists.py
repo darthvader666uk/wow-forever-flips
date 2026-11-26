@@ -42,9 +42,10 @@ MAIN = r"""local POISONS = {
 local f = CreateFrame("Frame")
 f:RegisterEvent("PLAYER_LOGIN")
 -- Snipe caps and prices come from the hourly AH pull, but the game only reads Lists.lua on a
--- /reload. When the AH opens with data over 75 minutes old, a newer file is almost certainly
--- waiting, so say so. If it still says so straight after a /reload, the hourly pull has stopped.
-local STALE = 75 * 60
+-- /reload. A release goes out every 3 hours, about 16 minutes after its snapshot, so when the AH
+-- opens with data over 3.5 hours old a newer file is almost certainly waiting, so say so. If it
+-- still says so straight after updating and a /reload, the pull has stopped.
+local STALE = 210 * 60
 local stale = CreateFrame("Frame")
 stale:RegisterEvent("AUCTION_HOUSE_SHOW")
 stale:SetScript("OnEvent", function()
